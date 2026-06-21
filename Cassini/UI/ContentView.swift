@@ -1,0 +1,321 @@
+import SwiftUI
+
+struct ContentView: View {
+    @Environment(RingController.self) private var controller
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch controller.phase {
+                case .idle, .scanning, .bluetoothOff, .error:
+                    ScanView()
+                default:
+                    DashboardView()
+                }
+            }
+            .navigationTitle("Cassini")
+        }
+    }
+}
+
+// MARK: - Scan / onboarding
+
+struct ScanView: View {
+    @Environment(RingController.self) private var controller
+
+    var body: some View {
+        List {
+            Section {
+                statusRow
+            }
+            if controller.hasKnownRing {
+                Section {
+                    Button {
+                        controller.reconnectKnown()
+                    } label: {
+                        Label("Reconnect last ring", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+            Section("Rings nearby") {
+                if controller.discovered.isEmpty {
+                    Text("Scanning for a ring advertising the service…")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(controller.discovered) { ring in
+                    Button {
+                        controller.selectRing(ring)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(ring.name)
+                                Text(ring.id.uuidString).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("\(ring.rssi) dBm").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            Section {
+                Button("Rescan") { controller.beginScan() }
+            } footer: {
+                Text("A new ring is paired + onboarded (accept the system Bluetooth dialog). A ring you've already onboarded just reconnects with its stored key.")
+            }
+        }
+    }
+
+    @ViewBuilder private var statusRow: some View {
+        switch controller.phase {
+        case .bluetoothOff:
+            Label("Bluetooth is off or unauthorized", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        case .scanning:
+            Label("Scanning…", systemImage: "dot.radiowaves.left.and.right")
+        case .error(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+        default:
+            Label("Idle", systemImage: "circle")
+        }
+    }
+}
+
+// MARK: - Dashboard
+
+struct DashboardView: View {
+    @Environment(RingController.self) private var controller
+
+    private let columns = [GridItem(.adaptive(minimum: 150), spacing: 12)]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let name = controller.connectedRingName {
+                    Text(name).font(.title2.weight(.semibold))
+                }
+                phaseBanner
+
+                LazyVGrid(columns: columns, spacing: 12) {
+                    MetricTile(title: "Heart Rate",
+                               value: controller.metrics.hrBpm.map { "\(Int($0))" } ?? "—",
+                               unit: "bpm", systemImage: "heart.fill", tint: .red)
+                    MetricTile(title: "SpO₂",
+                               value: controller.metrics.spo2.map { String(format: "%.0f", $0) } ?? "—",
+                               unit: "%", systemImage: "lungs.fill", tint: .blue)
+                    MetricTile(title: "Temperature",
+                               value: controller.metrics.temperatureC.map { String(format: "%.2f", $0) } ?? "—",
+                               unit: "°C", systemImage: "thermometer.medium", tint: .orange)
+                    MetricTile(title: "Battery",
+                               value: controller.metrics.batteryPct.map { "\($0)" } ?? "—",
+                               unit: controller.metrics.batteryMv.map { "% · \($0)mV" } ?? "%",
+                               systemImage: "battery.100", tint: .green)
+                }
+
+                if let last = controller.metrics.lastUpdate {
+                    Text("Updated \(last.formatted(date: .omitted, time: .standard))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                ActionsPanel()
+                DebugPanel()
+
+                LogView(title: "Translated log", lines: controller.log, monospaced: true) {
+                    controller.copyTranslatedLog()
+                }
+                LogView(title: "Raw log", lines: controller.rawLog, monospaced: true) {
+                    controller.copyRawLog()
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Disconnect") { controller.stop() }
+                }
+                .padding(.top, 8)
+            }
+            .padding()
+        }
+    }
+
+    @ViewBuilder private var phaseBanner: some View {
+        let (text, image, tint): (String, String, Color) = {
+            switch controller.phase {
+            case .connecting: return ("Connecting…", "antenna.radiowaves.left.and.right", .secondary)
+            case .onboarding: return ("Onboarding (accept the pairing dialog)", "key.fill", .orange)
+            case .authenticating: return ("Authenticating…", "lock.fill", .secondary)
+            case .streaming: return ("Streaming", "dot.radiowaves.up.forward", .green)
+            case .error(let m): return (m, "exclamationmark.triangle.fill", .red)
+            default: return ("", "", .secondary)
+            }
+        }()
+        if !text.isEmpty {
+            Label(text, systemImage: image)
+                .font(.subheadline)
+                .foregroundStyle(tint)
+        }
+    }
+}
+
+struct MetricTile: View {
+    let title: String
+    let value: String
+    let unit: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: systemImage)
+                .font(.caption).foregroundStyle(tint)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value).font(.system(size: 34, weight: .semibold, design: .rounded))
+                Text(unit).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+// MARK: - Actions panel (every command as a button)
+
+private struct RingAction: Identifiable {
+    var id: String { title }
+    let title: String
+    var role: ButtonRole?
+    let perform: () -> Void
+    init(_ title: String, role: ButtonRole? = nil, _ perform: @escaping () -> Void) {
+        self.title = title; self.role = role; self.perform = perform
+    }
+}
+
+struct ActionsPanel: View {
+    @Environment(RingController.self) private var controller
+    @State private var rawHex = ""
+
+    private let columns = [GridItem(.adaptive(minimum: 130), spacing: 8)]
+
+    var body: some View {
+        DisclosureGroup("Actions") {
+            VStack(alignment: .leading, spacing: 14) {
+                group("Measurement", [
+                    RingAction("Measure now") { controller.triggerMeasurement() },
+                    RingAction("DHR burst") { controller.triggerDHRBurst() },
+                    RingAction("Realtime raw") { controller.triggerRealtimeRaw() },
+                    RingAction("Accelerometer") { controller.triggerAccelerometer() },
+                    RingAction("ON_DEMAND+2Hz") { controller.triggerOnDemand2Hz() },
+                    RingAction("ACM+2Hz") { controller.triggerACM2Hz() },
+                    RingAction("Read params") { controller.readFeatureParams() },
+                ])
+                group("Features", [
+                    RingAction("SpO₂ on") { controller.setSpO2(true) },
+                    RingAction("SpO₂ off") { controller.setSpO2(false) },
+                    RingAction("Activity-HR on") { controller.setActivityHR(true) },
+                    RingAction("Activity-HR off") { controller.setActivityHR(false) },
+                    RingAction("DHR on") { controller.setDHR(true) },
+                    RingAction("DHR off") { controller.setDHR(false) },
+                ])
+                group("Data", [
+                    RingAction("Battery") { controller.requestBattery() },
+                    RingAction("Data flush") { controller.flushNow() },
+                    RingAction("GetEvent drain") { controller.getEventDrain() },
+                    RingAction("GetEvent ack") { controller.getEventAck() },
+                    RingAction("Subscribe-enable") { controller.sendSubscribeEnable() },
+                    RingAction("Time-sync") { controller.sendTimeSync() },
+                ])
+                group("Reset", [
+                    RingAction("Factory reset", role: .destructive) { controller.factoryReset() },
+                    RingAction("BLE-bond reset") { controller.bondOnlyReset() },
+                ])
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Raw command (hex)").font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        TextField("e.g. 0c 00", text: $rawHex)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                        Button("Send") { controller.sendRawHex(rawHex) }
+                            .buttonStyle(.bordered)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .font(.subheadline)
+    }
+
+    @ViewBuilder private func group(_ title: String, _ actions: [RingAction]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+                ForEach(actions) { a in
+                    Button(a.title, role: a.role, action: a.perform)
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+    }
+}
+
+struct DebugPanel: View {
+    @Environment(RingController.self) private var controller
+
+    var body: some View {
+        @Bindable var controller = controller
+        DisclosureGroup("Debug") {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("Auto-measure HR on connect", isOn: $controller.autoMeasureOnConnect)
+                Button("Reset logs + stats") { controller.resetLogsAndStats() }
+                    .buttonStyle(.bordered)
+                if !controller.frameStats.isEmpty {
+                    HStack {
+                        Text("Frame counts").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Copy", systemImage: "doc.on.doc") { controller.copyFrameStats() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(controller.frameStats.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+                            Text("\(k)  ×\(v)").font(.caption2.monospaced()).textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .font(.subheadline)
+    }
+}
+
+struct LogView: View {
+    let title: String
+    let lines: [String]
+    var monospaced: Bool = false
+    let onCopy: () -> Void
+
+    var body: some View {
+        DisclosureGroup("\(title) (\(lines.count))") {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Button("Copy", systemImage: "doc.on.doc") { onCopy() }
+                        .buttonStyle(.bordered)
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(lines.suffix(80).enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(monospaced ? .caption2.monospaced() : .caption2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+}
+
+#Preview {
+    ContentView().environment(RingController())
+}
