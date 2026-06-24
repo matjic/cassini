@@ -19,6 +19,10 @@ enum ByteMath {
         Int(p[o]) | (Int(p[o + 1]) << 8) | (Int(p[o + 2]) << 16)
     }
 
+    static func u32le(_ p: [UInt8], _ o: Int) -> UInt32 {
+        UInt32(p[o]) | (UInt32(p[o + 1]) << 8) | (UInt32(p[o + 2]) << 16) | (UInt32(p[o + 3]) << 24)
+    }
+
     /// Median of a non-empty sorted-on-the-fly Int collection; nil if empty.
     static func median(_ values: [Int]) -> Double? {
         guard !values.isEmpty else { return nil }

@@ -27,7 +27,24 @@ struct LiveMetrics: Equatable {
     var acmY: Int?
     var acmZ: Int?
     var motionMagnitude: Int?
+    // Sleep / autonomic (mostly from the overnight buffer drain).
+    var hrvRmssd: Int?
+    var breathRate: Double?
+    var sleepState: Int?
+    var sleepTempC: Double?
+    var wearStateName: String?
+    var bedtimeStart: UInt32?
+    var bedtimeEnd: UInt32?
+    var ppgSampleCount: Int?
     var lastUpdate: Date?
+    // Per-tile "time reported" — the event's wall-clock time (from the ring_time
+    // anchor when available, else arrival time).
+    var hrAt: Date?
+    var hrvAt: Date?
+    var breathAt: Date?
+    var spo2At: Date?
+    var tempAt: Date?
+    var batteryAt: Date?
 }
 
 /// Orchestrates the full connect → authenticate → stream flow (spec §3.2/§3.3/
@@ -44,10 +61,25 @@ final class RingController {
     private(set) var phase: RingPhase = .idle
     private(set) var discovered: [DiscoveredRing] = []
     private(set) var metrics = LiveMetrics()
+    /// Persisted sync cursor (highest drained `ring_time`), surfaced for the UI.
+    private(set) var cursor: UInt32 = 0
+    /// Human-readable result of the last GetEvent (e.g. "data → last_rt=…", "empty").
+    private(set) var lastDrainInfo = "—"
+    /// Whether the most recent GetEvent delivered data — drives adaptive drain speed.
+    private var lastDrainHadData = false
+
+    // Live feature state read back from the ring (nil = not yet known). These drive
+    // the Feature toggles so they reflect the ring, not just what we last sent.
+    private(set) var featureDHR: Bool?
+    private(set) var featureActivityHR: Bool?
+    private(set) var featureSpO2: Bool?
     /// Translated log — human-readable interpretation per our best understanding.
     private(set) var log: [String] = []
     /// Raw log — every frame as `ms<TAB>RX/TX<TAB>hex`.
     private(set) var rawLog: [String] = []
+    /// Absolute path of the current session's on-disk log file (full, uncapped).
+    private(set) var logFilePath: String?
+    private var logFileHandle: FileHandle?
     /// Model name read from GAP after connecting (e.g. "Oura Ring 4").
     private(set) var connectedRingName: String?
     /// nil until known; true if the GAP name matches the paired model name.
@@ -59,6 +91,13 @@ final class RingController {
     var autoMeasureOnConnect: Bool {
         didSet { UserDefaults.standard.set(autoMeasureOnConnect, forKey: "cassini.autoMeasure") }
     }
+    /// Reset the sync cursor to 0 on every connect so the full buffer always drains.
+    /// `ring_time` is per-session and rolls back when the ring reboots, which leaves
+    /// a persisted high cursor stale (GetEvent returns empty) — draining from 0
+    /// avoids that. Off = incremental sync from the saved cursor (spec.md §3.8).
+    var drainFromStartOnConnect: Bool {
+        didSet { UserDefaults.standard.set(drainFromStartOnConnect, forKey: "cassini.drainFromStart") }
+    }
     /// Per-frame-type counts (e.g. "i:60" inner type 0x60, "o:2f.28" outer 2F sub-op 0x28).
     private(set) var frameStats: [String: Int] = [:]
     private var logStart: Date?
@@ -66,6 +105,12 @@ final class RingController {
     private var consumeTask: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
     private var setupTask: Task<Void, Never>?
+
+    /// When set, the flush loop periodically re-arms the DHR burst (mode 3/sub 2),
+    /// which the ring auto-reverts ~20 s after each trigger. Keeping it armed is
+    /// what makes the ring keep computing + streaming live 0x60 IBI (HR) events.
+    private var keepHRAlive = false
+    private var flushTick = 0
 
     // One-shot frame matcher used by the handshake steps.
     private var pendingMatcher: ((OuterFrame) -> Bool)?
@@ -75,6 +120,9 @@ final class RingController {
     private let knownRingKey = "cassini.knownRingID"
     private let cursorKey = "cassini.lastRingTime"
 
+    /// Stateful raw-PPG (0x81) decoder; reset on session boundary.
+    private let ppgDecoder = CVARawPPGDecoder()
+
     // UTC anchor (spec §3.8).
     private var anchorRingTime: UInt32?
     private var anchorUnixMs: Double?
@@ -82,6 +130,7 @@ final class RingController {
 
     init() {
         autoMeasureOnConnect = UserDefaults.standard.object(forKey: "cassini.autoMeasure") as? Bool ?? true
+        drainFromStartOnConnect = UserDefaults.standard.object(forKey: "cassini.drainFromStart") as? Bool ?? true
         transport.onDiscover = { [weak self] ring in
             guard let self else { return }
             if !self.discovered.contains(where: { $0.id == ring.id }) {
@@ -182,6 +231,8 @@ final class RingController {
 
     private func connect(id: UUID, onboarding: Bool) async {
         do {
+            logStart = nil          // reset the elapsed-time origin for this run
+            startLogFile()          // one fresh timestamped file per connection
             phase = onboarding ? .onboarding : .connecting
             addLog("Connecting to \(id.uuidString)…")
             try await transport.connect(id: id)
@@ -284,6 +335,11 @@ final class RingController {
 
     /// The ordered post-auth setup writes (spec §3.7).
     private func runConnectSequence() {
+        // ring_time is per-session and rolls back on ring reboot, so a persisted
+        // high cursor goes stale (GetEvent returns empty → no readings). Default to
+        // draining from 0 each connect so data always flows.
+        if drainFromStartOnConnect { setCursor(0) }
+        cursor = lastCursor   // surface the (possibly reset) per-ring cursor
         let w = txRaw
         w([0x08, 0x03, 0x00, 0x00, 0x00])
         w([0x2F, 0x02, 0x01, 0x00])
@@ -332,10 +388,28 @@ final class RingController {
         flushTask?.cancel()
         flushTask = Task { @MainActor in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(4))
-                if Task.isCancelled { break }
+                // Issue a flush + GetEvent from the current cursor, then wait a
+                // short beat for the 0x11 response + records to land.
+                lastDrainHadData = false
                 txRaw(RingCommand.dataFlush)
                 txRaw(RingCommand.getEvent(ringTime: lastCursor, max: 255))
+                flushTick += 1
+                // Re-arm the DHR burst every ~12 s of idle cycles — it auto-reverts
+                // ~20 s after each trigger, and a dropped burst stalls live HR (0x60).
+                if keepHRAlive && flushTick % 3 == 0 {
+                    txRaw(RingCommand.paramSetByte0(id: RingCommand.paramDHR, value: 3))
+                    txRaw(RingCommand.paramSetByte2(id: RingCommand.paramDHR, value: 2))
+                }
+                try? await Task.sleep(for: .milliseconds(700))
+                if Task.isCancelled { break }
+                // Adaptive cadence: if that GetEvent delivered data there's more in
+                // the buffer — drain again immediately. Otherwise idle at ~4 s to
+                // keep the link alive (spec.md §3.6/§3.8).
+                if lastDrainHadData {
+                    flushTick -= 1   // don't let fast drains spam the DHR re-arm
+                } else {
+                    try? await Task.sleep(for: .seconds(3))
+                }
             }
         }
     }
@@ -376,6 +450,7 @@ final class RingController {
             if let b = RingDecoders.battery(rawValue: raw) {
                 metrics.batteryPct = b.percent
                 metrics.batteryMv = b.voltageMv
+                metrics.batteryAt = Date()
                 touch()
             }
         case 0x33:
@@ -383,36 +458,103 @@ final class RingController {
                 metrics.acmX = a.x; metrics.acmY = a.y; metrics.acmZ = a.z
                 metrics.motionMagnitude = a.magnitude; touch()
             }
+        case 0x11:
+            // GetEvent response (spec.md §3.8): payload[0]=status (0=empty, 0xFF=data).
+            let status = frame.payload.first ?? 0
+            lastDrainHadData = status != 0
+            if status == 0 {
+                lastDrainInfo = "empty (cursor \(cursor))"
+            } else {
+                let p = frame.payload
+                let rt = p.count >= 6
+                    ? UInt32(p[2]) | UInt32(p[3]) << 8 | UInt32(p[4]) << 16 | UInt32(p[5]) << 24
+                    : 0
+                lastDrainInfo = "data → last_rt=\(rt)"
+            }
+        case 0x2F:
+            // Secure-session param get/set replies drive the feature toggles.
+            handleParamReply(frame.payload)
         default:
             break   // described in the translated log; metrics handled above
         }
     }
 
+    /// Track feature-param values reported by the ring so the UI toggles reflect
+    /// real on-ring state. `2F … 21 <id> b0 b1 b2 b3` = read reply; `23`/`27` are
+    /// set-acks (we re-read after a set to confirm).
+    private func handleParamReply(_ p: [UInt8]) {
+        guard let sub = p.first else { return }
+        switch sub {
+        case 0x21 where p.count >= 6:
+            let id = p[1], b0 = p[2]
+            switch id {
+            case RingCommand.paramDHR: featureDHR = b0 != 0
+            case RingCommand.paramActivityHR: featureActivityHR = b0 != 0
+            case RingCommand.paramSpO2: featureSpO2 = b0 != 0
+            default: break
+            }
+        case 0x23, 0x27 where p.count >= 2:
+            // set-ack: confirm by re-reading that param.
+            txRaw(RingCommand.paramRead(id: p[1]))
+        default:
+            break
+        }
+    }
+
     private func handleInner(_ r: InnerRecord) {
         guard !r.isSuspect else { return }
+        // Event wall-clock time (from the §3.8 anchor; falls back to arrival time).
+        let at = eventTime(forRingTime: r.ringTime) ?? Date()
         switch r.type {
         case EventTag.ibiAndAmplitude.rawValue:
             if let d = RingDecoders.ibiAndAmplitude(r.payload), let hr = d.hrBpm {
-                metrics.hrBpm = hr; touch()
+                metrics.hrBpm = hr; metrics.hrAt = at; touch()
             }
         case EventTag.greenIBIQuality.rawValue:
             if let d = RingDecoders.greenIBIQuality(r.payload), let hr = d.hrBpm {
-                metrics.hrBpm = hr; touch()
+                metrics.hrBpm = hr; metrics.hrAt = at; touch()
+            }
+        case EventTag.hrvEvent.rawValue:
+            if let h = RingDecoders.hrvEvent(r.payload), let w = h.windows.last {
+                metrics.hrBpm = Double(w.hrBpm); metrics.hrAt = at
+                metrics.hrvRmssd = w.rmssdMs; metrics.hrvAt = at; touch()
             }
         case EventTag.spo2RPI.rawValue:
             if let s = RingDecoders.spo2RPI(r.payload), let last = s.last {
-                metrics.spo2 = last.spo2; touch()
+                metrics.spo2 = last.spo2; metrics.spo2At = at; touch()
             }
         case EventTag.tempEvent.rawValue:
             if let t = RingDecoders.tempEvent(r.payload),
                let first = t.channelsC.compactMap({ $0 }).first {
-                metrics.temperatureC = first; touch()
+                metrics.temperatureC = first; metrics.tempAt = at; touch()
+            }
+        case EventTag.sleepTemp.rawValue:
+            if let st = RingDecoders.sleepTempEvent(r.payload), let last = st.lastC {
+                metrics.sleepTempC = last; touch()
+            }
+        case EventTag.sleepPeriodInfo.rawValue:
+            if let sp = RingDecoders.sleepPeriodInfo(r.payload) {
+                if sp.averageHr > 0 { metrics.hrBpm = sp.averageHr; metrics.hrAt = at }
+                metrics.breathRate = sp.breath; metrics.breathAt = at
+                metrics.sleepState = sp.sleepState
+                touch()
+            }
+        case EventTag.bedtimePeriod.rawValue:
+            if let b = RingDecoders.bedtimePeriod(r.payload) {
+                metrics.bedtimeStart = b.startRingTime; metrics.bedtimeEnd = b.endRingTime; touch()
             }
         case EventTag.motionEvent.rawValue:
             if let m = RingDecoders.motionEvent(r.payload) {
                 metrics.acmX = m.acmX; metrics.acmY = m.acmY; metrics.acmZ = m.acmZ
                 metrics.motionMagnitude = m.magnitude; touch()
             }
+        case EventTag.stateChange.rawValue, EventTag.wearEvent.rawValue:
+            if let s = RingDecoders.stateChange(r.payload) {
+                metrics.wearStateName = s.stateName ?? "state \(s.state)"; touch()
+            }
+        case EventTag.cvaRawPPG.rawValue:
+            _ = ppgDecoder.feed(r.payload)
+            metrics.ppgSampleCount = ppgDecoder.sampleCount; touch()
         case EventTag.timeSyncInd.rawValue:
             if let ts = RingDecoders.timeSyncInd(r.payload) {
                 anchorRingTime = r.ringTime
@@ -422,6 +564,7 @@ final class RingController {
         case EventTag.ringStartInd.rawValue:
             if let anchor = anchorRingTime, r.ringTime < anchor {
                 anchorRingTime = nil; anchorUnixMs = nil   // ring restarted (§3.8)
+                ppgDecoder.reset()                          // new sampler session
             }
         default:
             break
@@ -464,14 +607,34 @@ final class RingController {
         UserDefaults.standard.string(forKey: knownRingKey).flatMap(UUID.init)
     }
 
+    /// Per-ring cursor key so switching rings never reuses a stale cursor.
+    private var perRingCursorKey: String {
+        knownRingID.map { "\(cursorKey).\($0.uuidString)" } ?? cursorKey
+    }
+
     private var lastCursor: UInt32 {
-        UInt32(UserDefaults.standard.integer(forKey: cursorKey))
+        UInt32(UserDefaults.standard.integer(forKey: perRingCursorKey))
     }
 
     private func advanceCursor(to ringTime: UInt32) {
         if ringTime > lastCursor {
-            UserDefaults.standard.set(Int(ringTime), forKey: cursorKey)
+            UserDefaults.standard.set(Int(ringTime), forKey: perRingCursorKey)
+            cursor = ringTime
         }
+    }
+
+    /// Set the cursor to an absolute value (used by reset + ring-restart rollback).
+    private func setCursor(_ value: UInt32) {
+        UserDefaults.standard.set(Int(value), forKey: perRingCursorKey)
+        cursor = value
+    }
+
+    /// Wall-clock time for a `ring_time`, via the §3.8 anchor. nil until a `0x42`
+    /// time-sync has established the anchor.
+    func eventTime(forRingTime rt: UInt32) -> Date? {
+        guard let art = anchorRingTime, let aunix = anchorUnixMs else { return nil }
+        let ms = aunix + Double(Int64(rt) - Int64(art)) * anchorTickMs
+        return Date(timeIntervalSince1970: ms / 1000.0)
     }
 
     private func handleDisconnect() {
@@ -486,20 +649,25 @@ final class RingController {
         flushTask?.cancel(); flushTask = nil
         consumeTask?.cancel(); consumeTask = nil
         setupTask?.cancel(); setupTask = nil
+        keepHRAlive = false; flushTick = 0
+        ppgDecoder.reset()
+        closeLogFile()
     }
 
     // MARK: Debug helpers
 
-    /// Fire an on-demand HR measurement: DHR burst (mode 3 / sub 2) + a realtime
-    /// measurement request. Per-session — these don't persist across reconnects.
+    /// Fire on-demand HR the clean way: just the DHR burst (mode 3 / sub 2), and
+    /// keep it armed via the flush loop. This is open_ring's HR path — it makes the
+    /// ring compute + stream live 0x60 IBI events. (Deliberately NOT paired with the
+    /// realtime-raw 06 07 request, which floods raw PPG instead of computed IBI.)
     func triggerMeasurement() {
         triggerDHRBurst()
-        triggerRealtimeRaw()
     }
 
-    /// DHR burst only (param 02 mode 3 / sub 2) — tests whether this alone yields
-    /// computed 0x60 IBI events (vs the raw PPG stream from realtime).
+    /// DHR burst (param 02 mode 3 / sub 2) and arm the keep-alive so the flush loop
+    /// re-fires it before the ring's ~20 s auto-revert, sustaining the IBI stream.
     func triggerDHRBurst() {
+        keepHRAlive = true
         sendNamed("DHR byte0=3", RingCommand.paramSetByte0(id: RingCommand.paramDHR, value: 3))
         sendNamed("DHR byte2=2", RingCommand.paramSetByte2(id: RingCommand.paramDHR, value: 2))
     }
@@ -550,8 +718,10 @@ final class RingController {
     }
 
     private func rawAppend(_ dir: String, _ bytes: [UInt8]) {
-        rawLog.append("\(Self.pad(elapsedMs(), 7))  \(dir)  \(Self.hex(bytes))")
+        let stamped = "\(Self.pad(elapsedMs(), 7))  \(dir)  \(Self.hex(bytes))"
+        rawLog.append(stamped)
         if rawLog.count > 1200 { rawLog.removeFirst(rawLog.count - 1200) }
+        fileLog(stamped)
     }
 
     /// Right-align an integer to a fixed width for monospaced column alignment.
@@ -581,16 +751,85 @@ final class RingController {
 
     private func bump(_ key: String) { frameStats[key, default: 0] += 1 }
 
+    /// Human label for a frame-stat key ("o:2f.28", "i:60"). ASCII only so it
+    /// survives copy/paste into any context.
+    private static func frameLabel(_ key: String) -> String {
+        switch key {
+        case "i:60": return "IBI+amp (HR)"
+        case "i:80": return "green IBI (HR)"
+        case "i:5d": return "HRV"
+        case "i:8b": return "SpO2"
+        case "i:46": return "temp"
+        case "i:69": return "temp period"
+        case "i:75": return "sleep temp"
+        case "i:6a": return "sleep info (HR/breath)"
+        case "i:72": return "sleep ACM period"
+        case "i:6c": return "feature session"
+        case "i:50": return "activity info"
+        case "i:82": return "scan start"
+        case "i:83": return "scan end"
+        case "i:85": return "RTC beacon"
+        case "i:56": return "unnamed (1B)"
+        // Real records (uniform payloads) absent from open_ring's corpus — newer
+        // firmware. Surfaced raw; semantics not yet reverse-engineered.
+        case "i:62": return "undocumented 8B (RE)"
+        case "i:65": return "undocumented 9B (RE)"
+        case "i:66": return "undocumented 12B (RE)"
+        case "i:47": return "motion"
+        case "i:6b": return "motion period"
+        case "i:81": return "raw PPG (CVA)"
+        case "i:68": return "raw PPG"
+        case "i:76": return "bedtime"
+        case "i:42": return "time-sync"
+        case "i:41": return "ring-start"
+        case "i:45", "i:53": return "state/wear"
+        case "i:43": return "debug event"
+        case "i:61": return "debug data"
+        case "i:5b": return "DHR result?"
+        case "i:1f": return "marker"
+        case "i:09": return "session info"
+        case "o:0d": return "battery"
+        case "o:11": return "GetEvent resp"
+        case "o:13": return "time-sync ack"
+        case "o:17": return "subscribe ack"
+        case "o:07": return "realtime ack"
+        case "o:25": return "SetAuthKey resp"
+        case "o:29": return "flush ack"
+        case "o:33": return "accelerometer"
+        case "o:2f.21": return "param read resp"
+        case "o:2f.23": return "set-ack b0"
+        case "o:2f.27": return "set-ack b2"
+        case "o:2f.28": return "raw PPG"
+        case "o:2f.02": return "param bulk dump"
+        case "o:2f.2c": return "auth nonce"
+        case "o:2f.2e": return "auth status"
+        default: return ""
+        }
+    }
+
+    /// Frame stats as aligned, annotated lines, sorted by count (desc). Shared by
+    /// the on-screen Debug panel and the clipboard copy.
+    var frameStatLines: [String] {
+        let sorted = frameStats.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        let keyW = sorted.map(\.key.count).max() ?? 0
+        let cntW = sorted.map { String($0.value).count }.max() ?? 0
+        return sorted.map { k, v in
+            let left = k.padding(toLength: keyW, withPad: " ", startingAt: 0)
+            let cnt = Self.pad(v, cntW)
+            let label = Self.frameLabel(k)
+            return label.isEmpty ? "\(left)  x\(cnt)" : "\(left)  x\(cnt)  \(label)"
+        }
+    }
+
     /// Copy the raw log (`ms<TAB>RX/TX<TAB>hex`) to the clipboard.
     func copyRawLog() { UIPasteboard.general.string = rawLog.joined(separator: "\n") }
     /// Copy the translated log to the clipboard.
     func copyTranslatedLog() { UIPasteboard.general.string = log.joined(separator: "\n") }
-    /// Copy the frame-type counts to the clipboard.
+    /// Copy the frame-type counts to the clipboard (ASCII, count-sorted, labeled).
     func copyFrameStats() {
-        UIPasteboard.general.string = frameStats
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)  ×\($0.value)" }
-            .joined(separator: "\n")
+        let total = frameStats.values.reduce(0, +)
+        UIPasteboard.general.string =
+            (["Frame counts (\(total) total)"] + frameStatLines).joined(separator: "\n")
     }
 
     /// Clear both logs and the frame-type stats.
@@ -665,23 +904,64 @@ final class RingController {
         case EventTag.greenIBIQuality.rawValue:
             return "greenIBI rt=\(r.ringTime) hr=\(hr(RingDecoders.greenIBIQuality(r.payload)?.hrBpm))"
         case EventTag.hrvEvent.rawValue:
-            let n = RingDecoders.hrvEvent(r.payload)?.windows.count ?? 0
-            return "HRV rt=\(r.ringTime) windows=\(n)"
+            let w = RingDecoders.hrvEvent(r.payload)?.windows.last
+            return "HRV rt=\(r.ringTime) hr=\(w.map { "\($0.hrBpm)" } ?? "—") rmssd=\(w.map { "\($0.rmssdMs)" } ?? "—")ms"
         case EventTag.spo2RPI.rawValue:
             let s = RingDecoders.spo2RPI(r.payload)?.last
             return "SpO2 rt=\(r.ringTime) ~\(s.map { String(format: "%.0f", $0.spo2) } ?? "—")%"
         case EventTag.tempEvent.rawValue:
             let t = RingDecoders.tempEvent(r.payload)?.channelsC.compactMap { $0 } ?? []
             return "temp rt=\(r.ringTime) \(t)°C"
+        case EventTag.tempPeriod.rawValue:
+            return "tempPeriod rt=\(r.ringTime) raw=\(RingDecoders.tempPeriod(r.payload)?.raw ?? 0)"
+        case EventTag.sleepTemp.rawValue:
+            let st = RingDecoders.sleepTempEvent(r.payload)
+            return "sleepTemp rt=\(r.ringTime) n=\(st?.tempsC.count ?? 0) last=\(st?.lastC.map { String(format: "%.2f", $0) } ?? "—")°C"
+        case EventTag.sleepPeriodInfo.rawValue:
+            if let sp = RingDecoders.sleepPeriodInfo(r.payload) {
+                return "sleepInfo rt=\(r.ringTime) hr=\(hr(sp.averageHr)) breath=\(String(format: "%.1f", sp.breath)) state=\(sp.sleepState) motion=\(sp.motionCount)"
+            }
+            return "sleepInfo rt=\(r.ringTime) (short)"
+        case EventTag.bedtimePeriod.rawValue:
+            let b = RingDecoders.bedtimePeriod(r.payload)
+            return "bedtime rt=\(r.ringTime) start=\(b?.startRingTime ?? 0) end=\(b?.endRingTime ?? 0)"
         case EventTag.motionEvent.rawValue:
             return "motion rt=\(r.ringTime) mag=\(RingDecoders.motionEvent(r.payload)?.magnitude ?? 0)"
+        case EventTag.motionPeriod.rawValue:
+            return "motionPeriod rt=\(r.ringTime) state=\(RingDecoders.motionPeriod(r.payload)?.state ?? 0)"
+        case EventTag.cvaRawPPG.rawValue:   // feeding happens in handleInner (stateful)
+            return "rawPPG(0x81) rt=\(r.ringTime) \(r.payload.count)B"
+        case EventTag.rawPPG.rawValue:
+            return "rawPPG(0x68) rt=\(r.ringTime): \(Self.hex(r.payload))"
         case EventTag.timeSyncInd.rawValue: return "time-sync rt=\(r.ringTime)"
-        case EventTag.ringStartInd.rawValue: return "ring-start rt=\(r.ringTime)"
+        case EventTag.ringStartInd.rawValue:
+            return "ring-start rt=\(r.ringTime) ts=\(RingDecoders.ringStartInd(r.payload)?.timestamp ?? 0)"
         case EventTag.stateChange.rawValue, EventTag.wearEvent.rawValue:
-            return "state/wear rt=\(r.ringTime) state=\(r.payload.first ?? 0)"
+            let s = RingDecoders.stateChange(r.payload)
+            return "state rt=\(r.ringTime) \(s?.stateName ?? "state \(s?.state ?? 0)") \(s?.text ?? "")"
+        case EventTag.debugEvent.rawValue:   // 0x43 — firmware log line (ASCII)
+            return "dbg rt=\(r.ringTime): \(Self.ascii(r.payload))"
+        case EventTag.debugData.rawValue:    // 0x61 — debug data; often ASCII (cat byte + text)
+            return "dbg rt=\(r.ringTime): \(Self.asciiOrHex(r.payload))"
+        case 0x5B:   // RE: appears when DHR engages — likely the DHR/HR result frame
+            return "meas(0x5b) rt=\(r.ringTime) sub=\(r.payload.first ?? 0): \(Self.hex(r.payload))"
         case 0x1F: return "marker(0x1f) rt=\(r.ringTime)"
         default: return "inner 0x\(hx(r.type)) rt=\(r.ringTime): \(Self.hex(r.payload))"
         }
+    }
+
+    /// Render bytes as printable ASCII (non-printable → '.').
+    private static func ascii(_ bytes: [UInt8]) -> String {
+        String(bytes.map { (0x20...0x7E).contains($0) ? Character(UnicodeScalar($0)) : "." })
+    }
+
+    /// ASCII if the payload is mostly printable, else hex. The first byte is often
+    /// a non-printable category tag, so it's checked from offset 1.
+    private static func asciiOrHex(_ bytes: [UInt8]) -> String {
+        guard bytes.count > 1 else { return hex(bytes) }
+        let body = Array(bytes.dropFirst())
+        let printable = body.filter { (0x20...0x7E).contains($0) }.count
+        return printable * 100 >= body.count * 70 ? ascii(body) : "(bin) \(hex(bytes))"
     }
 
     // MARK: Manual command actions (debug Actions panel)
@@ -690,6 +970,22 @@ final class RingController {
     func flushNow() { sendNamed("data_flush", RingCommand.dataFlush) }
     func getEventDrain() { sendNamed("GetEvent drain", RingCommand.getEvent(ringTime: lastCursor, max: 255)) }
     func getEventAck() { sendNamed("GetEvent ack", RingCommand.getEvent(ringTime: lastCursor, max: 0)) }
+
+    /// Drain the ring's full flash history from the start (cursor = 0). Replays
+    /// stored 0x60 IBI + 0x5D HRV (5-min HR) records the ring buffered while
+    /// disconnected — this is the historical-HR path. The consume loop advances
+    /// the persisted cursor as records arrive, so re-runs only fetch what's new.
+    func drainHistory() {
+        sendNamed("data_flush", RingCommand.dataFlush)
+        sendNamed("GetEvent history (from 0)", RingCommand.getEvent(ringTime: 0, max: 255))
+    }
+
+    /// Reset the persisted sync cursor to 0 so the next drain starts from the
+    /// earliest buffered event again.
+    func resetCursor() {
+        setCursor(0)
+        addLog("Sync cursor reset to 0.")
+    }
     func sendSubscribeEnable() { sendNamed("subscribe-enable", RingCommand.subscribeEnable) }
     func sendTimeSync() {
         let counter = UInt32(Date().timeIntervalSince1970) / 256
@@ -702,10 +998,26 @@ final class RingController {
         sendNamed("activityHR=\(on ? 1 : 0)", RingCommand.paramSetByte0(id: RingCommand.paramActivityHR, value: on ? 1 : 0))
     }
     func setDHR(_ on: Bool) {
+        if !on { keepHRAlive = false }   // stop the flush loop re-arming the burst
         sendNamed("DHR=\(on ? 1 : 0)", RingCommand.paramSetByte0(id: RingCommand.paramDHR, value: on ? 1 : 0))
     }
     /// BLE-bond-only reset (`1A 01 01`) — forces re-pair but KEEPS the auth key.
     func bondOnlyReset() { sendNamed("BLE-bond reset (keeps key)", [0x1A, 0x01, 0x01]) }
+
+    /// Export the stored auth key (hex) for the known ring to the clipboard, so an
+    /// external clean-room client (e.g. open_ring) can reuse the key Cassini
+    /// provisioned via SetAuthKey — no rooted-phone Realm extraction needed. The
+    /// key is in the app's data-protection keychain, unreadable outside the app.
+    func copyAuthKey() {
+        guard let id = knownRingID, let key = keyStore.load(ringID: id.uuidString) else {
+            addLog("No stored auth key to export (onboard a ring first).")
+            return
+        }
+        let hex = key.map { String(format: "%02x", $0) }.joined()
+        UIPasteboard.general.string = hex
+        addLog("Auth key copied (\(key.count)B) for ring \(id.uuidString):")
+        addLog(hex)
+    }
 
     private func sendNamed(_ name: String, _ bytes: [UInt8]) {
         txRaw(bytes)
@@ -736,7 +1048,51 @@ final class RingController {
     private func touch() { metrics.lastUpdate = Date() }
 
     private func addLog(_ line: String) {
-        log.append("\(Self.pad(elapsedMs(), 7))  \(line)")
+        let stamped = "\(Self.pad(elapsedMs(), 7))  \(line)"
+        log.append(stamped)
         if log.count > 500 { log.removeFirst(log.count - 500) }
+        fileLog(stamped)
     }
+
+    // MARK: Session file log (full, uncapped — one timestamped file per run)
+
+    /// Open a fresh timestamped log file in the app's Documents container. Both the
+    /// raw frame stream and the translated lines are appended here as they happen,
+    /// so the on-disk file keeps the full history the in-memory buffers cap off.
+    private func startLogFile() {
+        closeLogFile()
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return }
+        let stamp = Self.fileStampFormatter.string(from: Date())
+        let url = dir.appendingPathComponent("cassini-\(stamp).log")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        logFileHandle = try? FileHandle(forWritingTo: url)
+        logFilePath = url.path
+        let header = "# Cassini session log \(stamp)\n# columns: <ms>  <RX/TX or text>\n"
+        if let d = header.data(using: .utf8) { try? logFileHandle?.write(contentsOf: d) }
+        addLog("Logging to file: \(url.path)")
+    }
+
+    private func closeLogFile() {
+        try? logFileHandle?.close()
+        logFileHandle = nil
+    }
+
+    private func fileLog(_ line: String) {
+        guard let h = logFileHandle, let d = (line + "\n").data(using: .utf8) else { return }
+        try? h.write(contentsOf: d)
+    }
+
+    /// Copy the current session log file path to the clipboard.
+    func copyLogFilePath() {
+        guard let p = logFilePath else { addLog("No log file yet (connect first)."); return }
+        UIPasteboard.general.string = p
+        addLog("Log file path copied.")
+    }
+
+    private static let fileStampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        return f
+    }()
 }

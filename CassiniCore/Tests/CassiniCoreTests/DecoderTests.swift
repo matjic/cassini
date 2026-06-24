@@ -90,4 +90,54 @@ struct DecoderTests {
         #expect(ts.tickMs == 100.0)
         #expect(ts.ringUnixSeconds == 0x10 * 256)
     }
+
+    // MARK: Sleep / extended decoders (spec §3.5 + open_ring supplement)
+
+    @Test func sleepTempSeries() {
+        // two u16 LE centi-°C: 0x0CD8=3288→32.88, 0x0CE2=3298→32.98
+        let st = try! #require(RingDecoders.sleepTempEvent([0xD8, 0x0C, 0xE2, 0x0C]))
+        #expect(st.tempsC.count == 2)
+        #expect(abs(st.tempsC[0] - 32.88) < 0.001)
+        #expect(abs((st.lastC ?? 0) - 32.98) < 0.001)
+        #expect(RingDecoders.sleepTempEvent([0x00]) == nil)   // odd length
+    }
+
+    @Test func bedtimeWindow() {
+        let b = try! #require(RingDecoders.bedtimePeriod([0x01, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]))
+        #expect(b.startRingTime == 1)
+        #expect(b.endRingTime == 255)
+        #expect(RingDecoders.bedtimePeriod([0x01, 0x02]) == nil)
+    }
+
+    @Test func sleepPeriodInfoScales() {
+        // avg_hr 130*0.5=65, breath 64/8=8.0, sleep_state 2, motion 10, cv 0x8000/65536=0.5
+        let p: [UInt8] = [130, 0x00, 0x00, 0x00, 64, 64, 10, 2, 0x00, 0x80]
+        let sp = try! #require(RingDecoders.sleepPeriodInfo(p))
+        #expect(sp.averageHr == 65.0)
+        #expect(sp.breath == 8.0)
+        #expect(sp.sleepState == 2)
+        #expect(sp.motionCount == 10)
+        #expect(abs(sp.cv - 0.5) < 0.001)
+        #expect(RingDecoders.sleepPeriodInfo([UInt8](repeating: 0, count: 9)) == nil)
+    }
+
+    @Test func stateChangeEnum() {
+        let s = try! #require(RingDecoders.stateChange([0x06, 0x68, 0x69]))  // 6 + "hi"
+        #expect(s.state == 6)
+        #expect(s.stateName == "FINGER_HR_USER_IN_REST")
+        #expect(s.isAsleep)
+        #expect(s.text == "hi")
+    }
+
+    /// CVA raw-PPG delta codec: 0x80 marker + 3-byte LE absolute, then signed deltas.
+    @Test func cvaPpgDeltaCodec() {
+        let dec = CVARawPPGDecoder()
+        // absolute 0x000064 = 100, then +1, then -2 (0xFE)
+        let out = dec.feed([0x80, 0x64, 0x00, 0x00, 0x01, 0xFE])
+        #expect(out == [100, 101, 99])
+        #expect(dec.sampleCount == 3)
+        // negative absolute via sign-extension: 0xFFFFFF = -1
+        let neg = CVARawPPGDecoder().feed([0x80, 0xFF, 0xFF, 0xFF])
+        #expect(neg == [-1])
+    }
 }

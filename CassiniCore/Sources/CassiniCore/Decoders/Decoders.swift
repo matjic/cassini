@@ -9,6 +9,7 @@ public enum EventTag: UInt8, Sendable {
     case tempEvent = 0x46
     case tempPeriod = 0x69
     case sleepTemp = 0x75
+    case sleepPeriodInfo = 0x6A
     case motionEvent = 0x47
     case motionPeriod = 0x6B
     case rawPPG = 0x68
@@ -86,6 +87,83 @@ public struct ACMSample: Equatable, Sendable {
     public let y: Int
     public let z: Int
     public var magnitude: Int { Int((Double(x * x + y * y + z * z)).squareRoot()) }
+}
+
+// MARK: - 0x69 TEMP_PERIOD (spec §3.5; layout per open_ring)
+
+public struct TempPeriod: Equatable, Sendable {
+    public let raw: Int   // i16 LE; physical units TBD
+}
+
+// MARK: - 0x75 SLEEP_TEMP_EVENT (spec §3.9; N×u16 LE centi-°C, ~30 s spacing)
+
+public struct SleepTempEvent: Equatable, Sendable {
+    public let tempsC: [Double]   // ends at the record's time, ~30 s apart
+    public var lastC: Double? { tempsC.last }
+}
+
+// MARK: - 0x6B MOTION_PERIOD (spec §3.5; motion-state per open_ring)
+
+public struct MotionPeriod: Equatable, Sendable {
+    public let state: Int         // 30 s motion-state enum (payload[0])
+}
+
+// MARK: - 0x76 BEDTIME_PERIOD (spec §3.5; 2×u32 LE ring_time, layout per open_ring)
+
+public struct BedtimePeriod: Equatable, Sendable {
+    public let startRingTime: UInt32
+    public let endRingTime: UInt32
+}
+
+// MARK: - 0x6A SLEEP_PERIOD_INFO_2 (open_ring supplement; not in spec §3.5)
+
+/// Per-period sleep summary the ring buffers overnight: sleep-state, average HR,
+/// and breath rate. Fixed-point scales are open_ring's RE'd .rodata constants.
+public struct SleepPeriodInfo: Equatable, Sendable {
+    public let averageHr: Double   // bpm  (wire u8 × 0.5)
+    public let hrTrend: Double     // i8 × 0.0625
+    public let mzci: Double        // u8 × 0.0625
+    public let dzci: Double        // u8 × 0.0625
+    public let breath: Double      // breaths/min (u8 / 8)
+    public let breathV: Double     // u8 / 8
+    public let motionCount: Int
+    public let sleepState: Int     // 0/1/2 enum
+    public let cv: Double          // u16 LE / 65536 → [0,1)
+}
+
+// MARK: - 0x45 STATE_CHANGE / 0x53 WEAR_EVENT (spec §3.9)
+
+public struct StateChange: Equatable, Sendable {
+    public let state: Int
+    public let text: String        // trailing ASCII narration
+    /// Wear/HR state-machine names. spec §3.9 lists a partial enum; the full set
+    /// is an open_ring supplement.
+    public var stateName: String? {
+        switch state {
+        case 0: return "UNSPECIFIED"
+        case 1: return "NOT_IN_FINGER"
+        case 2: return "FINGER_DETECTION"          // probing for finger contact
+        case 3: return "FINGER_USER_ACTIVE"
+        case 4: return "FINGER_USER_IN_REST"
+        case 5: return "FINGER_HR_USER_ACTIVE"
+        case 6: return "FINGER_HR_USER_IN_REST"    // ≈ asleep
+        case 7: return "OUT_OF_POWER"
+        case 8: return "CHARGING"
+        case 9: return "HIBERNATE_LOW_POWER"
+        case 20: return "PRODUCTION_DIAGNOSTIC"
+        case 21: return "PRODUCTION_TESTING"
+        case 22: return "PRODUCTION_TESTING_CHARGING"
+        case 30: return "HW_TEST"
+        default: return nil
+        }
+    }
+    public var isAsleep: Bool { state == 6 }
+}
+
+// MARK: - 0x41 RING_START_IND (spec §3.9; u32 timestamp + firmware bytes)
+
+public struct RingStartInd: Equatable, Sendable {
+    public let timestamp: UInt32
 }
 
 // MARK: - 0x42 TIME_SYNC_IND (spec §3.9)
@@ -219,10 +297,114 @@ public enum RingDecoders {
                          z: ByteMath.i16le(p, 6))
     }
 
+    /// 0x69 — 2 bytes: i16 LE temperature (physical units TBD; spec §3.5).
+    public static func tempPeriod(_ p: [UInt8]) -> TempPeriod? {
+        guard p.count >= 2 else { return nil }
+        return TempPeriod(raw: ByteMath.i16le(p, 0))
+    }
+
+    /// 0x75 — N×u16 LE centi-°C; samples ~30 s apart ending at the record time.
+    public static func sleepTempEvent(_ p: [UInt8]) -> SleepTempEvent? {
+        guard p.count >= 2, p.count % 2 == 0 else { return nil }
+        var temps: [Double] = []
+        var o = 0
+        while o + 2 <= p.count { temps.append(Double(ByteMath.u16le(p, o)) / 100.0); o += 2 }
+        return SleepTempEvent(tempsC: temps)
+    }
+
+    /// 0x6B — motion-state enum at payload[0] (30 s window); spec §3.5.
+    public static func motionPeriod(_ p: [UInt8]) -> MotionPeriod? {
+        guard let first = p.first else { return nil }
+        return MotionPeriod(state: Int(first))
+    }
+
+    /// 0x76 — 8 bytes: start/end ring_time (u32 LE each); spec §3.5.
+    public static func bedtimePeriod(_ p: [UInt8]) -> BedtimePeriod? {
+        guard p.count >= 8 else { return nil }
+        return BedtimePeriod(startRingTime: ByteMath.u32le(p, 0), endRingTime: ByteMath.u32le(p, 4))
+    }
+
+    /// 0x6A — 10 bytes; sleep-period summary (open_ring supplement). Fixed-point
+    /// scales from open_ring's RE'd firmware constants.
+    public static func sleepPeriodInfo(_ p: [UInt8]) -> SleepPeriodInfo? {
+        guard p.count >= 10 else { return nil }
+        return SleepPeriodInfo(
+            averageHr: Double(p[0]) * 0.5,
+            hrTrend: Double(ByteMath.i8(p[1])) * 0.0625,
+            mzci: Double(p[2]) * 0.0625,
+            dzci: Double(p[3]) * 0.0625,
+            breath: Double(p[4]) / 8.0,
+            breathV: Double(p[5]) / 8.0,
+            motionCount: Int(p[6]),
+            sleepState: ByteMath.i8(p[7]),
+            cv: Double(ByteMath.u16le(p, 8)) / 65536.0
+        )
+    }
+
+    /// 0x45 / 0x53 — `<state:u8><text:ASCII>` wear & HR state machine (spec §3.9).
+    public static func stateChange(_ p: [UInt8]) -> StateChange? {
+        guard let state = p.first else { return nil }
+        let text = String(decoding: p.dropFirst(), as: UTF8.self)
+        return StateChange(state: Int(state), text: text)
+    }
+
+    /// 0x41 — u32 LE timestamp + firmware bytes (spec §3.9). Session boundary.
+    public static func ringStartInd(_ p: [UInt8]) -> RingStartInd? {
+        guard p.count >= 4 else { return nil }
+        return RingStartInd(timestamp: ByteMath.u32le(p, 0))
+    }
+
     /// Battery from the full outer-frame ATT value `[0x0D, len, payload…]`
     /// (spec §3.9 indexes the raw value): pct = raw[2], mv = raw[6]|raw[7]<<8.
     public static func battery(rawValue raw: [UInt8]) -> BatteryStatus? {
         guard raw.count >= 8 else { return nil }
         return BatteryStatus(percent: Int(raw[2]), voltageMv: Int(raw[6]) | (Int(raw[7]) << 8))
+    }
+}
+
+// MARK: - 0x81 CVA_RAW_PPG (spec §3.5; stateful delta codec per open_ring)
+
+/// Stateful decoder for the `0x81` raw-PPG stream (spec §3.5). The wire format
+/// is a delta codec: a `0x80` marker introduces a 3-byte LE absolute sample
+/// (sign-extended from 24 bits); any other byte is a signed-int8 delta against
+/// the running value. State persists across records within a sampler session —
+/// `reset()` on a session boundary (new `sess` / counter discontinuity). Held
+/// on the main actor by the controller, so not `Sendable`.
+public final class CVARawPPGDecoder {
+    private var collectingAbsolute = false
+    private var subCounter = 0
+    private var accumulator: UInt32 = 0
+    private var lastValue: Int = 0
+    public private(set) var sampleCount = 0
+
+    public init() {}
+
+    public func reset() {
+        collectingAbsolute = false; subCounter = 0; accumulator = 0; lastValue = 0
+    }
+
+    /// Feed one `0x81` record payload; returns the samples (24-bit signed ADC
+    /// counts) emitted by this record.
+    public func feed(_ payload: [UInt8]) -> [Int] {
+        var out: [Int] = []
+        for b in payload {
+            if collectingAbsolute {
+                if subCounter <= 2 { accumulator |= UInt32(b) << (subCounter * 8); subCounter += 1 }
+                if subCounter == 3 {
+                    var sample = Int(accumulator)
+                    if b & 0x80 != 0 { sample = Int(accumulator | 0xFF00_0000) - 0x1_0000_0000 }
+                    lastValue = sample
+                    out.append(sample)
+                    collectingAbsolute = false
+                }
+            } else if b == 0x80 {
+                accumulator = 0; subCounter = 0; collectingAbsolute = true
+            } else {
+                lastValue += Int(ByteMath.i8(b))
+                out.append(lastValue)
+            }
+        }
+        sampleCount += out.count
+        return out
     }
 }

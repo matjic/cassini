@@ -99,18 +99,32 @@ struct DashboardView: View {
                 LazyVGrid(columns: columns, spacing: 12) {
                     MetricTile(title: "Heart Rate",
                                value: controller.metrics.hrBpm.map { "\(Int($0))" } ?? "—",
-                               unit: "bpm", systemImage: "heart.fill", tint: .red)
+                               unit: "bpm", systemImage: "heart.fill", tint: .red,
+                               time: controller.metrics.hrAt)
+                    MetricTile(title: "HRV",
+                               value: controller.metrics.hrvRmssd.map { "\($0)" } ?? "—",
+                               unit: "ms", systemImage: "waveform.path.ecg", tint: .pink,
+                               time: controller.metrics.hrvAt)
+                    MetricTile(title: "Breath",
+                               value: controller.metrics.breathRate.map { String(format: "%.1f", $0) } ?? "—",
+                               unit: "br/min", systemImage: "wind", tint: .teal,
+                               time: controller.metrics.breathAt)
                     MetricTile(title: "SpO₂",
                                value: controller.metrics.spo2.map { String(format: "%.0f", $0) } ?? "—",
-                               unit: "%", systemImage: "lungs.fill", tint: .blue)
+                               unit: "%", systemImage: "lungs.fill", tint: .blue,
+                               time: controller.metrics.spo2At)
                     MetricTile(title: "Temperature",
-                               value: controller.metrics.temperatureC.map { String(format: "%.2f", $0) } ?? "—",
-                               unit: "°C", systemImage: "thermometer.medium", tint: .orange)
+                               value: controller.metrics.temperatureC.map { String(format: "%.1f", $0 * 9 / 5 + 32) } ?? "—",
+                               unit: "°F", systemImage: "thermometer.medium", tint: .orange,
+                               time: controller.metrics.tempAt)
                     MetricTile(title: "Battery",
                                value: controller.metrics.batteryPct.map { "\($0)" } ?? "—",
                                unit: controller.metrics.batteryMv.map { "% · \($0)mV" } ?? "%",
-                               systemImage: "battery.100", tint: .green)
+                               systemImage: "battery.100", tint: .green,
+                               time: controller.metrics.batteryAt)
                 }
+
+                SleepStatusView()
 
                 if let last = controller.metrics.lastUpdate {
                     Text("Updated \(last.formatted(date: .omitted, time: .standard))")
@@ -162,6 +176,7 @@ struct MetricTile: View {
     let unit: String
     let systemImage: String
     let tint: Color
+    var time: Date? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -171,10 +186,70 @@ struct MetricTile: View {
                 Text(value).font(.system(size: 34, weight: .semibold, design: .rounded))
                 Text(unit).font(.caption).foregroundStyle(.secondary)
             }
+            Text(time.map { $0.formatted(date: .omitted, time: .standard) } ?? " ")
+                .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+// MARK: - Sleep & status (populated mainly after a history drain)
+
+struct SleepStatusView: View {
+    @Environment(RingController.self) private var controller
+
+    var body: some View {
+        let m = controller.metrics
+        let rows: [(String, String)] = {
+            var r: [(String, String)] = []
+            if let s = m.wearStateName { r.append(("Wear state", s)) }
+            if let st = m.sleepState { r.append(("Sleep state", sleepStateLabel(st))) }
+            if let t = m.sleepTempC { r.append(("Sleep temp", String(format: "%.1f °F", t * 9 / 5 + 32))) }
+            if let a = m.bedtimeStart, let b = m.bedtimeEnd { r.append(("Bedtime window", bedtime(a, b))) }
+            if let n = m.ppgSampleCount { r.append(("Raw PPG samples", "\(n)")) }
+            return r
+        }()
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Sleep & status", systemImage: "bed.double.fill")
+                    .font(.caption).foregroundStyle(.indigo)
+                ForEach(rows, id: \.0) { key, value in
+                    HStack {
+                        Text(key).foregroundStyle(.secondary)
+                        Spacer()
+                        Text(value).fontWeight(.medium)
+                    }
+                    .font(.caption)
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
+    /// Bedtime window as wall-clock + duration when the time anchor is available,
+    /// else the raw ring_time span.
+    private func bedtime(_ start: UInt32, _ end: UInt32) -> String {
+        let mins = Int(end > start ? end - start : 0) / 10 / 60   // ~10 ticks/s
+        if let a = controller.eventTime(forRingTime: start),
+           let b = controller.eventTime(forRingTime: end) {
+            let f: (Date) -> String = { $0.formatted(date: .omitted, time: .shortened) }
+            return "\(f(a)) → \(f(b)) (\(mins) min)"
+        }
+        return "rt \(start) → \(end) (~\(mins) min)"
+    }
+
+    /// 0x6A sleep_state enum (0/1/2; open_ring leaves exact stage naming open).
+    private func sleepStateLabel(_ s: Int) -> String {
+        switch s {
+        case 0: return "0 (awake/restless)"
+        case 1: return "1 (light?)"
+        case 2: return "2 (deep?)"
+        default: return "\(s)"
+        }
     }
 }
 
@@ -199,34 +274,46 @@ struct ActionsPanel: View {
     var body: some View {
         DisclosureGroup("Actions") {
             VStack(alignment: .leading, spacing: 14) {
-                group("Measurement", [
-                    RingAction("Measure now") { controller.triggerMeasurement() },
-                    RingAction("DHR burst") { controller.triggerDHRBurst() },
-                    RingAction("Realtime raw") { controller.triggerRealtimeRaw() },
+                // Live heart rate — the headline path (clean DHR burst, auto re-armed).
+                group("Heart rate", [
+                    RingAction("Measure HR") { controller.triggerMeasurement() },
+                    RingAction("Stop HR") { controller.setDHR(false) },
+                ])
+                // Other on-demand sensor streams (raw, for debugging/RE).
+                group("Sensor streams", [
+                    RingAction("Raw PPG") { controller.triggerRealtimeRaw() },
                     RingAction("Accelerometer") { controller.triggerAccelerometer() },
-                    RingAction("ON_DEMAND+2Hz") { controller.triggerOnDemand2Hz() },
-                    RingAction("ACM+2Hz") { controller.triggerACM2Hz() },
-                    RingAction("Read params") { controller.readFeatureParams() },
+                    RingAction("PPG @2Hz") { controller.triggerOnDemand2Hz() },
+                    RingAction("ACM @2Hz") { controller.triggerACM2Hz() },
                 ])
-                group("Features", [
-                    RingAction("SpO₂ on") { controller.setSpO2(true) },
-                    RingAction("SpO₂ off") { controller.setSpO2(false) },
-                    RingAction("Activity-HR on") { controller.setActivityHR(true) },
-                    RingAction("Activity-HR off") { controller.setActivityHR(false) },
-                    RingAction("DHR on") { controller.setDHR(true) },
-                    RingAction("DHR off") { controller.setDHR(false) },
-                ])
-                group("Data", [
-                    RingAction("Battery") { controller.requestBattery() },
-                    RingAction("Data flush") { controller.flushNow() },
+                // Persisted feature toggles — reflect real on-ring state (read back
+                // from the ring; "?" until the first param read lands).
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Features (persist, from ring)").font(.caption).foregroundStyle(.secondary)
+                    featureToggle("SpO₂", controller.featureSpO2) { controller.setSpO2($0) }
+                    featureToggle("Activity HR", controller.featureActivityHR) { controller.setActivityHR($0) }
+                    featureToggle("Daytime HR (DHR)", controller.featureDHR) { controller.setDHR($0) }
+                }
+                // Pull stored/overnight data off the ring.
+                group("History & sync", [
+                    RingAction("Drain history") { controller.drainHistory() },
+                    RingAction("Reset cursor") { controller.resetCursor() },
+                    RingAction("Flush now") { controller.flushNow() },
                     RingAction("GetEvent drain") { controller.getEventDrain() },
                     RingAction("GetEvent ack") { controller.getEventAck() },
-                    RingAction("Subscribe-enable") { controller.sendSubscribeEnable() },
                     RingAction("Time-sync") { controller.sendTimeSync() },
                 ])
+                // Low-level / one-off control.
+                group("Connection", [
+                    RingAction("Battery") { controller.requestBattery() },
+                    RingAction("Subscribe-enable") { controller.sendSubscribeEnable() },
+                    RingAction("Read params") { controller.readFeatureParams() },
+                    RingAction("Copy auth key") { controller.copyAuthKey() },
+                ])
+                // Destructive — bottom, out of the way.
                 group("Reset", [
-                    RingAction("Factory reset", role: .destructive) { controller.factoryReset() },
                     RingAction("BLE-bond reset") { controller.bondOnlyReset() },
+                    RingAction("Factory reset", role: .destructive) { controller.factoryReset() },
                 ])
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Raw command (hex)").font(.caption).foregroundStyle(.secondary)
@@ -242,6 +329,21 @@ struct ActionsPanel: View {
             .padding(.vertical, 4)
         }
         .font(.subheadline)
+    }
+
+    @ViewBuilder private func featureToggle(_ title: String, _ state: Bool?,
+                                            _ set: @escaping (Bool) -> Void) -> some View {
+        Toggle(isOn: Binding(get: { state ?? false }, set: { set($0) })) {
+            HStack(spacing: 6) {
+                Text(title)
+                if state == nil {
+                    Text("?").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .tint(.green)
     }
 
     @ViewBuilder private func group(_ title: String, _ actions: [RingAction]) -> some View {
@@ -266,6 +368,34 @@ struct DebugPanel: View {
         DisclosureGroup("Debug") {
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("Auto-measure HR on connect", isOn: $controller.autoMeasureOnConnect)
+                Toggle("Drain from start each connect", isOn: $controller.drainFromStartOnConnect)
+
+                // Sync cursor + last drain status (spec.md §3.8).
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Sync cursor").foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(controller.cursor)").fontWeight(.medium)
+                    }
+                    HStack {
+                        Text("Last GetEvent").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(controller.lastDrainInfo).fontWeight(.medium)
+                    }
+                }
+                .font(.caption)
+
+                // Session log file (full, uncapped).
+                if let path = controller.logFilePath {
+                    HStack {
+                        Button("Copy log path", systemImage: "doc.on.doc") { controller.copyLogFilePath() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                        Spacer()
+                    }
+                    Text(path).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                        .textSelection(.enabled).lineLimit(2)
+                }
+
                 Button("Reset logs + stats") { controller.resetLogsAndStats() }
                     .buttonStyle(.bordered)
                 if !controller.frameStats.isEmpty {
@@ -277,8 +407,8 @@ struct DebugPanel: View {
                             .controlSize(.small)
                     }
                     VStack(alignment: .leading, spacing: 1) {
-                        ForEach(controller.frameStats.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
-                            Text("\(k)  ×\(v)").font(.caption2.monospaced()).textSelection(.enabled)
+                        ForEach(Array(controller.frameStatLines.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.caption2.monospaced()).textSelection(.enabled)
                         }
                     }
                 }
