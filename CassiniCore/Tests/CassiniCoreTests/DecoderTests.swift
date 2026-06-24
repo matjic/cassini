@@ -129,6 +129,29 @@ struct DecoderTests {
         #expect(s.text == "hi")
     }
 
+    @Test func onDemandMeasFields() {
+        // 00 80 00 2d 02 00 00 00 → field0=0x008000, f1=0x022d/10=55.7
+        let m = try! #require(RingDecoders.onDemandMeas([0x00, 0x80, 0x00, 0x2d, 0x02, 0x00, 0x00, 0x00]))
+        #expect(m.field0 == 0x8000)
+        #expect(abs((m.f1 ?? 0) - 55.7) < 0.01)
+        #expect(m.b1 == 0)
+    }
+
+    @Test func featureSessionKind() {
+        let f = try! #require(RingDecoders.featureSession([0x0d, 0x01]))
+        #expect(f.feature == 0x0d)
+        #expect(f.kind == "cva_ppg_sampler_v1")
+        #expect(RingDecoders.featureSession([0x02, 0x00])?.kind == "spo2_v1")
+    }
+
+    @Test func sleepAcmValues() {
+        // first value = whole p[1] + p[0]/255
+        let v = try! #require(RingDecoders.sleepACMPeriod([0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0,0,0,0,0,0]))
+        #expect(abs(v.values[0] - (8.0 + 128.0 / 255.0)) < 0.001)
+        #expect(v.values.count == 6)
+        #expect(RingDecoders.sleepACMPeriod([0,0,0]) == nil)
+    }
+
     /// CVA raw-PPG delta codec: 0x80 marker + 3-byte LE absolute, then signed deltas.
     @Test func cvaPpgDeltaCodec() {
         let dec = CVARawPPGDecoder()

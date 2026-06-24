@@ -10,6 +10,13 @@ public enum EventTag: UInt8, Sendable {
     case tempPeriod = 0x69
     case sleepTemp = 0x75
     case sleepPeriodInfo = 0x6A
+    case onDemandMeas = 0x62
+    case onDemandSession = 0x65
+    case onDemandMotion = 0x66
+    case featureSession = 0x6C
+    case sleepACMPeriod = 0x72
+    case activityInfo = 0x50
+    case alertEvent = 0x56
     case motionEvent = 0x47
     case motionPeriod = 0x6B
     case rawPPG = 0x68
@@ -129,6 +136,48 @@ public struct SleepPeriodInfo: Equatable, Sendable {
     public let motionCount: Int
     public let sleepState: Int     // 0/1/2 enum
     public let cv: Double          // u16 LE / 65536 → [0,1)
+}
+
+// MARK: - 0x62/0x65/0x66 ON_DEMAND family (ringverse supplement; field layout per
+// ringverse parse.js — semantics not assigned upstream either)
+
+public struct OnDemandMeas: Equatable, Sendable {
+    public let field0: Int       // u24 LE
+    public let f1: Double?       // u16 LE / 10
+    public let b1: Int?
+    public let f2: Double?       // u8 / 10
+    public let b2: Int?
+}
+
+public struct OnDemandSession: Equatable, Sendable {
+    public let bytes: [UInt8]    // leading config bytes (constant in practice)
+    public let word: Int?        // optional trailing u16 LE
+}
+
+// MARK: - 0x6C FEATURE_SESSION (ringverse): which feature toggled + its kind
+
+public struct FeatureSession: Equatable, Sendable {
+    public let feature: Int
+    public let status: Int
+    public let kind: String?     // daytime_hr_v1 / spo2_v1 / exercise_hr / …
+}
+
+// MARK: - 0x72 SLEEP_ACM_PERIOD (ringverse): 6 accelerometer-intensity values
+
+public struct SleepACMPeriod: Equatable, Sendable {
+    public let values: [Double]
+}
+
+// MARK: - 0x50 ACTIVITY_INFO (ringverse/open_ring, partial): activity-class enum
+
+public struct ActivityInfo: Equatable, Sendable {
+    public let activityClass: Int
+}
+
+// MARK: - 0x56 ALERT_EVENT (ringverse): single alert-type byte
+
+public struct AlertEvent: Equatable, Sendable {
+    public let alertType: Int
 }
 
 // MARK: - 0x45 STATE_CHANGE / 0x53 WEAR_EVENT (spec §3.9)
@@ -339,6 +388,69 @@ public enum RingDecoders {
             sleepState: ByteMath.i8(p[7]),
             cv: Double(ByteMath.u16le(p, 8)) / 65536.0
         )
+    }
+
+    /// 0x62 — on-demand measurement (ringverse layout): progressive fields as the
+    /// payload grows. Field names are ringverse's (semantics unconfirmed upstream).
+    public static func onDemandMeas(_ p: [UInt8]) -> OnDemandMeas? {
+        guard p.count >= 3 else { return nil }
+        return OnDemandMeas(
+            field0: ByteMath.u24le(p, 0),
+            f1: p.count >= 5 ? Double(ByteMath.u16le(p, 3)) / 10 : nil,
+            b1: p.count >= 6 ? Int(p[5]) : nil,
+            f2: p.count >= 7 ? Double(p[6]) / 10 : nil,
+            b2: p.count >= 8 ? Int(p[7]) : nil
+        )
+    }
+
+    /// 0x65 — on-demand session descriptor (ringverse): leading bytes + optional
+    /// trailing u16. Constant in practice (a config record).
+    public static func onDemandSession(_ p: [UInt8]) -> OnDemandSession? {
+        guard p.count >= 1 else { return nil }
+        let lead = Array(p.prefix(7))
+        let word = p.count >= 9 ? ByteMath.u16le(p, 7) : nil
+        return OnDemandSession(bytes: lead, word: word)
+    }
+
+    /// 0x6C — feature lifecycle: `<feature:u8><status:u8>` + kind (ringverse).
+    public static func featureSession(_ p: [UInt8]) -> FeatureSession? {
+        guard p.count >= 2 else { return nil }
+        let feature = Int(p[0])
+        let kind: String?
+        switch feature {
+        case 0, 1: kind = "daytime_hr_v1"
+        case 2: kind = "spo2_v1"
+        case 3: kind = "exercise_hr"
+        case 0x0B: kind = "real_steps_v1"
+        case 0x0C: kind = "passthrough"
+        case 0x0D: kind = "cva_ppg_sampler_v1"
+        default: kind = nil
+        }
+        return FeatureSession(feature: feature, status: Int(p[1]), kind: kind)
+    }
+
+    /// 0x72 — 6 sleep accelerometer-intensity values (ringverse): three `whole +
+    /// frac/255`, three `(hi>>4) + 12-bit-frac/4095`.
+    public static func sleepACMPeriod(_ p: [UInt8]) -> SleepACMPeriod? {
+        guard p.count >= 12 else { return nil }
+        func f255(_ whole: Int, _ num: Int) -> Double { Double(whole) + Double(num) / 255.0 }
+        func f12(_ lo: Int, _ hi: Int) -> Double { Double(hi >> 4) + Double(lo | ((hi & 0xF) << 8)) / 4095.0 }
+        return SleepACMPeriod(values: [
+            f255(Int(p[1]), Int(p[0])), f255(Int(p[3]), Int(p[2])), f255(Int(p[5]), Int(p[4])),
+            f12(Int(p[6]), Int(p[7])), f12(Int(p[8]), Int(p[9])), f12(Int(p[10]), Int(p[11])),
+        ])
+    }
+
+    /// 0x50 — activity-class enum at payload[0] (ringverse/open_ring, partial).
+    public static func activityInfo(_ p: [UInt8]) -> ActivityInfo? {
+        guard let c = p.first else { return nil }
+        return ActivityInfo(activityClass: Int(c))
+    }
+
+    /// 0x56 — single alert-type byte (ringverse).
+    public static func alertEvent(_ p: [UInt8]) -> AlertEvent? {
+        guard let a = p.first else { return nil }
+        return AlertEvent(alertType: Int(a))
     }
 
     /// 0x45 / 0x53 — `<state:u8><text:ASCII>` wear & HR state machine (spec §3.9).

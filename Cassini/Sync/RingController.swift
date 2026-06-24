@@ -769,12 +769,10 @@ final class RingController {
         case "i:82": return "scan start"
         case "i:83": return "scan end"
         case "i:85": return "RTC beacon"
-        case "i:56": return "unnamed (1B)"
-        // Real records (uniform payloads) absent from open_ring's corpus — newer
-        // firmware. Surfaced raw; semantics not yet reverse-engineered.
-        case "i:62": return "undocumented 8B (RE)"
-        case "i:65": return "undocumented 9B (RE)"
-        case "i:66": return "undocumented 12B (RE)"
+        // On-demand measurement family (ringverse).
+        case "i:62": return "on-demand meas"
+        case "i:65": return "on-demand session"
+        case "i:66": return "on-demand motion"
         case "i:47": return "motion"
         case "i:6b": return "motion period"
         case "i:81": return "raw PPG (CVA)"
@@ -785,9 +783,45 @@ final class RingController {
         case "i:45", "i:53": return "state/wear"
         case "i:43": return "debug event"
         case "i:61": return "debug data"
-        case "i:5b": return "DHR result?"
-        case "i:1f": return "marker"
-        case "i:09": return "session info"
+        case "i:5b": return "ble connection"
+        case "i:56": return "alert event"
+        // Documented in ringverse/open_ring but not emitted by this firmware —
+        // named so frame counts have no blanks (surfaced raw; not decoded).
+        case "i:44": return "ibi event"
+        case "i:48": return "sleep period info"
+        case "i:49": return "sleep summary 1"
+        case "i:4a": return "ppg amplitude"
+        case "i:4b": return "sleep phase info"
+        case "i:4c": return "sleep summary 2"
+        case "i:4d": return "ring sleep feature"
+        case "i:4e": return "sleep phase details"
+        case "i:4f": return "sleep summary 3"
+        case "i:51": return "activity summary 1"
+        case "i:52": return "activity summary 2"
+        case "i:54": return "recovery summary"
+        case "i:58": return "sleep summary 4"
+        case "i:5a": return "sleep phase details"
+        case "i:5c": return "user info"
+        case "i:5e": return "selftest"
+        case "i:67": return "raw PPG summary"
+        case "i:6d": return "meas quality"
+        case "i:6e": return "SpO2 IBI+amp"
+        case "i:6f": return "SpO2 event"
+        case "i:71": return "green IBI+amp"
+        case "i:73": return "EHR trace"
+        case "i:74": return "EHR ACM intensity"
+        case "i:77": return "SpO2 DC"
+        case "i:79": return "selftest data/tag"
+        case "i:7b": return "SpO2 stable"
+        case "i:7c": return "SpO2 combo"
+        case "i:7e": return "real steps 1"
+        case "i:7f": return "real steps 2"
+        case "o:09": return "firmware/id resp"
+        case "o:0f": return "soft-reset ack"
+        case "o:19": return "event resp"
+        case "o:1d": return "state-cmd resp"
+        case "o:1e": return "state query"
+        case "o:1f": return "state-query resp"
         case "o:0d": return "battery"
         case "o:11": return "GetEvent resp"
         case "o:13": return "time-sync ack"
@@ -855,7 +889,12 @@ final class RingController {
             return "GetEvent → data (status \(status), last_rt=\(rt))"
         case 0x29: return "flush ack"
         case 0x07: return "realtime-measure ack (status \(p.count > 1 ? p[1] : (p.first ?? 0)))"
+        case 0x09: return "firmware/id resp: \(Self.hex(p))"          // time_or_id_resp
+        case 0x0F: return "soft-reset ack (status \(p.first ?? 0))"
         case 0x17: return "subscribe-enable ack"
+        case 0x19: return "event resp"                                // event_resp
+        case 0x1D: return "state-cmd resp"                            // state_cmd_resp
+        case 0x1F: return "state-query resp: \(Self.hex(p))"          // state_query_resp
         case 0x13: return "time-sync ack"
         case 0x1B: return "factory-reset ack (status \(p.count > 1 ? p[1] : 0))"
         case 0x25: return "SetAuthKey resp (status \(p.first ?? 0))"
@@ -929,6 +968,28 @@ final class RingController {
             return "motion rt=\(r.ringTime) mag=\(RingDecoders.motionEvent(r.payload)?.magnitude ?? 0)"
         case EventTag.motionPeriod.rawValue:
             return "motionPeriod rt=\(r.ringTime) state=\(RingDecoders.motionPeriod(r.payload)?.state ?? 0)"
+        case EventTag.onDemandMeas.rawValue:
+            if let m = RingDecoders.onDemandMeas(r.payload) {
+                return "onDemandMeas rt=\(r.ringTime) f0=\(m.field0) f1=\(m.f1.map { String(format: "%.1f", $0) } ?? "—") f2=\(m.f2.map { String(format: "%.1f", $0) } ?? "—")"
+            }
+            return "onDemandMeas rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case EventTag.onDemandSession.rawValue:
+            let s = RingDecoders.onDemandSession(r.payload)
+            return "onDemandSession rt=\(r.ringTime) cfg=\(s.map { Self.hex($0.bytes) } ?? "?") word=\(s?.word.map(String.init) ?? "—")"
+        case EventTag.onDemandMotion.rawValue:
+            return "onDemandMotion rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case EventTag.featureSession.rawValue:
+            if let f = RingDecoders.featureSession(r.payload) {
+                return "feature rt=\(r.ringTime) \(f.kind ?? "feat\(f.feature)") status=\(f.status)"
+            }
+            return "feature rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case EventTag.sleepACMPeriod.rawValue:
+            let v = RingDecoders.sleepACMPeriod(r.payload)?.values
+            return "sleepACM rt=\(r.ringTime) \(v.map { $0.map { String(format: "%.2f", $0) }.joined(separator: ",") } ?? Self.hex(r.payload))"
+        case EventTag.activityInfo.rawValue:
+            return "activity rt=\(r.ringTime) class=\(RingDecoders.activityInfo(r.payload)?.activityClass ?? 0)"
+        case EventTag.alertEvent.rawValue:
+            return "alert rt=\(r.ringTime) type=\(RingDecoders.alertEvent(r.payload)?.alertType ?? 0)"
         case EventTag.cvaRawPPG.rawValue:   // feeding happens in handleInner (stateful)
             return "rawPPG(0x81) rt=\(r.ringTime) \(r.payload.count)B"
         case EventTag.rawPPG.rawValue:
@@ -943,9 +1004,8 @@ final class RingController {
             return "dbg rt=\(r.ringTime): \(Self.ascii(r.payload))"
         case EventTag.debugData.rawValue:    // 0x61 — debug data; often ASCII (cat byte + text)
             return "dbg rt=\(r.ringTime): \(Self.asciiOrHex(r.payload))"
-        case 0x5B:   // RE: appears when DHR engages — likely the DHR/HR result frame
-            return "meas(0x5b) rt=\(r.ringTime) sub=\(r.payload.first ?? 0): \(Self.hex(r.payload))"
-        case 0x1F: return "marker(0x1f) rt=\(r.ringTime)"
+        case 0x5B:   // ble_connection_ind (ringverse/open_ring) — raw body
+            return "bleConn rt=\(r.ringTime): \(Self.hex(r.payload))"
         default: return "inner 0x\(hx(r.type)) rt=\(r.ringTime): \(Self.hex(r.payload))"
         }
     }
