@@ -186,12 +186,19 @@ struct MetricTile: View {
                 Text(value).font(.system(size: 34, weight: .semibold, design: .rounded))
                 Text(unit).font(.caption).foregroundStyle(.secondary)
             }
-            Text(time.map { $0.formatted(date: .omitted, time: .standard) } ?? " ")
+            Text(time.map(Self.stamp) ?? " ")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// Time-of-day (with seconds), prefixed with the date when it isn't today —
+    /// recording times can come from earlier days via a history drain.
+    static func stamp(_ d: Date) -> String {
+        let t = d.formatted(date: .omitted, time: .standard)
+        return Calendar.current.isDateInToday(d) ? t : "\(d.formatted(.dateTime.month().day())) \(t)"
     }
 }
 
@@ -230,12 +237,21 @@ struct SleepStatusView: View {
         }
     }
 
-    /// Bedtime window duration. start/end are per-session ring_time (~10 ticks/s),
-    /// so the span is valid even though absolute wall-clock isn't reconstructable
-    /// across sessions.
+    /// Bedtime window as actual recording clock-time + duration, resolved from
+    /// ring_time via the anchor (the timeline is continuous, so this is reliable).
     private func bedtime(_ start: UInt32, _ end: UInt32) -> String {
         let mins = Int(end > start ? end - start : 0) / 10 / 60
+        if let a = controller.eventTime(forRingTime: start),
+           let b = controller.eventTime(forRingTime: end) {
+            return "\(stamp(a)) → \(b.formatted(date: .omitted, time: .shortened)) (\(mins) min)"
+        }
         return "~\(mins) min (rt \(start)→\(end))"
+    }
+
+    /// Time-of-day, prefixed with the date when it isn't today.
+    private func stamp(_ d: Date) -> String {
+        let t = d.formatted(date: .omitted, time: .shortened)
+        return Calendar.current.isDateInToday(d) ? t : "\(d.formatted(.dateTime.month().day())) \(t)"
     }
 
     /// 0x6A sleep_state enum (0/1/2; open_ring leaves exact stage naming open).

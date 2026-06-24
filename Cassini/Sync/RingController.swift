@@ -503,11 +503,11 @@ final class RingController {
 
     private func handleInner(_ r: InnerRecord) {
         guard !r.isSuspect else { return }
-        // Tile timestamp = arrival time (when we received it). Reconstructing the
-        // ring's own event time from ring_time is unreliable across the multiple
-        // sessions a history drain spans (ring_time is per-session, not global),
-        // so we don't claim it on the tiles.
-        let at = Date()
+        // Prefer the ring's actual RECORDING time, resolved from ring_time via the
+        // §3.8 anchor. ring_time is a single continuous 100 ms/tick timeline (verified
+        // linear across days), so one anchor resolves the whole history. Fall back to
+        // arrival time only when no anchor is established yet.
+        let at = eventTime(forRingTime: r.ringTime) ?? Date()
         switch r.type {
         case EventTag.ibiAndAmplitude.rawValue:
             if let d = RingDecoders.ibiAndAmplitude(r.payload), let hr = d.hrBpm {
