@@ -123,10 +123,9 @@ final class RingController {
     /// Stateful raw-PPG (0x81) decoder; reset on session boundary.
     private let ppgDecoder = CVARawPPGDecoder()
 
-    // UTC anchor (spec §3.8).
-    private var anchorRingTime: UInt32?
-    private var anchorUnixMs: Double?
-    private var anchorTickMs: Double = 100.0
+    // Recording-time resolver (spec §3.8): maps ring_time → wall-clock via the
+    // time-sync anchor, with epoch/restart handling.
+    private let timeResolver = RingTimeResolver()
 
     init() {
         autoMeasureOnConnect = UserDefaults.standard.object(forKey: "cassini.autoMeasure") as? Bool ?? true
@@ -503,10 +502,10 @@ final class RingController {
 
     private func handleInner(_ r: InnerRecord) {
         guard !r.isSuspect else { return }
-        // Prefer the ring's actual RECORDING time, resolved from ring_time via the
-        // §3.8 anchor. ring_time is a single continuous 100 ms/tick timeline (verified
-        // linear across days), so one anchor resolves the whole history. Fall back to
-        // arrival time only when no anchor is established yet.
+        // Track stream position for epoch/restart detection, then prefer the ring's
+        // actual RECORDING time (resolved from ring_time via the §3.8 anchor); fall
+        // back to arrival time only when the current epoch isn't anchored yet.
+        timeResolver.observe(r.ringTime)
         let at = eventTime(forRingTime: r.ringTime) ?? Date()
         switch r.type {
         case EventTag.ibiAndAmplitude.rawValue:
@@ -561,15 +560,11 @@ final class RingController {
             metrics.ppgSampleCount = ppgDecoder.sampleCount; touch()
         case EventTag.timeSyncInd.rawValue:
             if let ts = RingDecoders.timeSyncInd(r.payload) {
-                anchorRingTime = r.ringTime
-                anchorUnixMs = Double(ts.ringUnixSeconds) * 1000.0
-                anchorTickMs = ts.tickMs
+                timeResolver.setAnchor(ringTime: r.ringTime,
+                                       unixSeconds: ts.ringUnixSeconds, tickMs: ts.tickMs)
             }
         case EventTag.ringStartInd.rawValue:
-            if let anchor = anchorRingTime, r.ringTime < anchor {
-                anchorRingTime = nil; anchorUnixMs = nil   // ring restarted (§3.8)
-                ppgDecoder.reset()                          // new sampler session
-            }
+            ppgDecoder.reset()   // new sampler session (epoch handled by the resolver)
         default:
             break
         }
@@ -633,13 +628,9 @@ final class RingController {
         cursor = value
     }
 
-    /// Wall-clock time for a `ring_time`, via the §3.8 anchor. nil until a `0x42`
-    /// time-sync has established the anchor.
-    func eventTime(forRingTime rt: UInt32) -> Date? {
-        guard let art = anchorRingTime, let aunix = anchorUnixMs else { return nil }
-        let ms = aunix + Double(Int64(rt) - Int64(art)) * anchorTickMs
-        return Date(timeIntervalSince1970: ms / 1000.0)
-    }
+    /// Wall-clock recording time for a `ring_time` (spec §3.8); nil until the
+    /// current epoch is anchored by a `0x42` time-sync.
+    func eventTime(forRingTime rt: UInt32) -> Date? { timeResolver.date(rt) }
 
     private func handleDisconnect() {
         flushTask?.cancel()
@@ -655,6 +646,7 @@ final class RingController {
         setupTask?.cancel(); setupTask = nil
         keepHRAlive = false; flushTick = 0
         ppgDecoder.reset()
+        timeResolver.reset()
         closeLogFile()
     }
 
