@@ -503,8 +503,11 @@ final class RingController {
 
     private func handleInner(_ r: InnerRecord) {
         guard !r.isSuspect else { return }
-        // Event wall-clock time (from the §3.8 anchor; falls back to arrival time).
-        let at = eventTime(forRingTime: r.ringTime) ?? Date()
+        // Tile timestamp = arrival time (when we received it). Reconstructing the
+        // ring's own event time from ring_time is unreliable across the multiple
+        // sessions a history drain spans (ring_time is per-session, not global),
+        // so we don't claim it on the tiles.
+        let at = Date()
         switch r.type {
         case EventTag.ibiAndAmplitude.rawValue:
             if let d = RingDecoders.ibiAndAmplitude(r.payload), let hr = d.hrBpm {
@@ -521,7 +524,8 @@ final class RingController {
             }
         case EventTag.spo2RPI.rawValue:
             if let s = RingDecoders.spo2RPI(r.payload), let last = s.last {
-                metrics.spo2 = last.spo2; metrics.spo2At = at; touch()
+                metrics.spo2 = min(100, max(0, last.spo2))   // clamp the approximation
+                metrics.spo2At = at; touch()
             }
         case EventTag.tempEvent.rawValue:
             if let t = RingDecoders.tempEvent(r.payload),
@@ -706,10 +710,16 @@ final class RingController {
         sendNamed("read SpO2", RingCommand.paramRead(id: RingCommand.paramSpO2))
     }
 
-    /// Write a command and record it in the raw log.
+    /// Write a command and record it in the raw log + the TX (output) stats.
     private func txRaw(_ bytes: [UInt8]) {
         transport.write(bytes)
         rawAppend("TX", bytes)
+        guard let op = bytes.first else { return }
+        if op == 0x2F, bytes.count > 2 {
+            bump(String(format: "t:2f.%02x", bytes[2]))   // sub-op after opcode+len
+        } else {
+            bump(String(format: "t:%02x", op))
+        }
     }
 
     private func elapsedMs() -> Int {
@@ -837,16 +847,32 @@ final class RingController {
         case "o:2f.02": return "param bulk dump"
         case "o:2f.2c": return "auth nonce"
         case "o:2f.2e": return "auth status"
+        // TX commands we send (outputs).
+        case "t:08": return "id/time probe"
+        case "t:0c": return "battery req"
+        case "t:10": return "GetEvent"
+        case "t:12": return "time-sync req"
+        case "t:16": return "subscribe-enable"
+        case "t:18": return "category subscribe"
+        case "t:1a": return "reset"
+        case "t:1c": return "state cmd"
+        case "t:24": return "SetAuthKey"
+        case "t:28": return "data flush"
+        case "t:06": return "realtime measure"
+        case "t:2f.01": return "nonce req"
+        case "t:2f.11": return "auth proof"
+        case "t:2f.20": return "param read"
+        case "t:2f.22": return "param set b0"
+        case "t:2f.26": return "param set b2"
         default: return ""
         }
     }
 
-    /// Frame stats as aligned, annotated lines, sorted by count (desc). Shared by
-    /// the on-screen Debug panel and the clipboard copy.
-    var frameStatLines: [String] {
-        let sorted = frameStats.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
-        let keyW = sorted.map(\.key.count).max() ?? 0
-        let cntW = sorted.map { String($0.value).count }.max() ?? 0
+    /// Format a subset of frameStats as aligned, annotated, count-sorted lines.
+    private func statLines(_ entries: [(String, Int)]) -> [String] {
+        let sorted = entries.sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
+        let keyW = sorted.map(\.0.count).max() ?? 0
+        let cntW = sorted.map { String($0.1).count }.max() ?? 0
         return sorted.map { k, v in
             let left = k.padding(toLength: keyW, withPad: " ", startingAt: 0)
             let cnt = Self.pad(v, cntW)
@@ -855,15 +881,28 @@ final class RingController {
         }
     }
 
+    /// Inputs — frames received from the ring (inner events `i:` + outer control `o:`).
+    var inputStatLines: [String] {
+        statLines(frameStats.filter { !$0.key.hasPrefix("t:") }.map { ($0.key, $0.value) })
+    }
+    /// Outputs — commands we sent to the ring (`t:`).
+    var outputStatLines: [String] {
+        statLines(frameStats.filter { $0.key.hasPrefix("t:") }.map { ($0.key, $0.value) })
+    }
+    var inputStatTotal: Int { frameStats.filter { !$0.key.hasPrefix("t:") }.values.reduce(0, +) }
+    var outputStatTotal: Int { frameStats.filter { $0.key.hasPrefix("t:") }.values.reduce(0, +) }
+
     /// Copy the raw log (`ms<TAB>RX/TX<TAB>hex`) to the clipboard.
     func copyRawLog() { UIPasteboard.general.string = rawLog.joined(separator: "\n") }
     /// Copy the translated log to the clipboard.
     func copyTranslatedLog() { UIPasteboard.general.string = log.joined(separator: "\n") }
-    /// Copy the frame-type counts to the clipboard (ASCII, count-sorted, labeled).
+    /// Copy both frame-count tables (inputs + outputs) to the clipboard in one go.
     func copyFrameStats() {
-        let total = frameStats.values.reduce(0, +)
-        UIPasteboard.general.string =
-            (["Frame counts (\(total) total)"] + frameStatLines).joined(separator: "\n")
+        var lines = ["== Inputs — received (\(inputStatTotal)) =="]
+        lines += inputStatLines
+        lines += ["", "== Outputs — sent (\(outputStatTotal)) =="]
+        lines += outputStatLines
+        UIPasteboard.general.string = lines.joined(separator: "\n")
     }
 
     /// Clear both logs and the frame-type stats.
@@ -946,8 +985,13 @@ final class RingController {
             let w = RingDecoders.hrvEvent(r.payload)?.windows.last
             return "HRV rt=\(r.ringTime) hr=\(w.map { "\($0.hrBpm)" } ?? "—") rmssd=\(w.map { "\($0.rmssdMs)" } ?? "—")ms"
         case EventTag.spo2RPI.rawValue:
-            let s = RingDecoders.spo2RPI(r.payload)?.last
-            return "SpO2 rt=\(r.ringTime) ~\(s.map { String(format: "%.0f", $0.spo2) } ?? "—")%"
+            if let s = RingDecoders.spo2RPI(r.payload)?.last {
+                let pct = min(100.0, max(0.0, s.spo2))
+                // Log the raw R + perfusion too — R is the real measurement and is
+                // what a calibration fit needs (the % is only the textbook approx).
+                return "SpO2 rt=\(r.ringTime) ~\(String(format: "%.0f", pct))% approx (R=\(String(format: "%.3f", s.rValue)) PI=\(String(format: "%.3f", s.irPi)))"
+            }
+            return "SpO2 rt=\(r.ringTime) —"
         case EventTag.tempEvent.rawValue:
             let t = RingDecoders.tempEvent(r.payload)?.channelsC.compactMap { $0 } ?? []
             return "temp rt=\(r.ringTime) \(t)°C"
@@ -1006,6 +1050,10 @@ final class RingController {
             return "dbg rt=\(r.ringTime): \(Self.asciiOrHex(r.payload))"
         case 0x5B:   // ble_connection_ind (ringverse/open_ring) — raw body
             return "bleConn rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case 0x82: return "scanStart rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case 0x83: return "scanEnd rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case 0x85: return "rtcBeacon rt=\(r.ringTime): \(Self.hex(r.payload))"
+        case 0x5C: return "userInfo rt=\(r.ringTime): \(Self.hex(r.payload))"
         default: return "inner 0x\(hx(r.type)) rt=\(r.ringTime): \(Self.hex(r.payload))"
         }
     }

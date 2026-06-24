@@ -109,7 +109,7 @@ struct DashboardView: View {
                                value: controller.metrics.breathRate.map { String(format: "%.1f", $0) } ?? "—",
                                unit: "br/min", systemImage: "wind", tint: .teal,
                                time: controller.metrics.breathAt)
-                    MetricTile(title: "SpO₂",
+                    MetricTile(title: "SpO₂ (est.)",
                                value: controller.metrics.spo2.map { String(format: "%.0f", $0) } ?? "—",
                                unit: "%", systemImage: "lungs.fill", tint: .blue,
                                time: controller.metrics.spo2At)
@@ -230,16 +230,12 @@ struct SleepStatusView: View {
         }
     }
 
-    /// Bedtime window as wall-clock + duration when the time anchor is available,
-    /// else the raw ring_time span.
+    /// Bedtime window duration. start/end are per-session ring_time (~10 ticks/s),
+    /// so the span is valid even though absolute wall-clock isn't reconstructable
+    /// across sessions.
     private func bedtime(_ start: UInt32, _ end: UInt32) -> String {
-        let mins = Int(end > start ? end - start : 0) / 10 / 60   // ~10 ticks/s
-        if let a = controller.eventTime(forRingTime: start),
-           let b = controller.eventTime(forRingTime: end) {
-            let f: (Date) -> String = { $0.formatted(date: .omitted, time: .shortened) }
-            return "\(f(a)) → \(f(b)) (\(mins) min)"
-        }
-        return "rt \(start) → \(end) (~\(mins) min)"
+        let mins = Int(end > start ? end - start : 0) / 10 / 60
+        return "~\(mins) min (rt \(start)→\(end))"
     }
 
     /// 0x6A sleep_state enum (0/1/2; open_ring leaves exact stage naming open).
@@ -406,16 +402,25 @@ struct DebugPanel: View {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                     }
-                    VStack(alignment: .leading, spacing: 1) {
-                        ForEach(Array(controller.frameStatLines.enumerated()), id: \.offset) { _, line in
-                            Text(line).font(.caption2.monospaced()).textSelection(.enabled)
-                        }
-                    }
+                    frameTable("Inputs — received (\(controller.inputStatTotal))", controller.inputStatLines)
+                    frameTable("Outputs — sent (\(controller.outputStatTotal))", controller.outputStatLines)
                 }
             }
             .padding(.vertical, 4)
         }
         .font(.subheadline)
+    }
+
+    @ViewBuilder private func frameTable(_ title: String, _ lines: [String]) -> some View {
+        if !lines.isEmpty {
+            Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 1) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+            }
+        }
     }
 }
 
